@@ -16,6 +16,16 @@
 //    "well"           mittleres Ausgabefach mit Lichtschranke    (1x)
 //    "weight"         Andruckgewicht für den Kartenstapel        (2x)
 //
+//  Austeil-Modul (Dealer) – zusätzlich:
+//    "dealer"         Gesamtansicht Dealer (nicht drucken)
+//    "everything"     Mischer + Dealer (nicht drucken)
+//    "tray_dealer"    Kartenmagazin mit Sensorfenster            (1x)
+//    "dealer_box"     drehender Kasten mit Wellennabe            (1x)
+//    "dealer_hub"     Nabe für die Schrittmotorwelle             (1x)
+//    "dealer_lid"     Deckel mit Schrittmotor-Aufnahme           (1x)
+//    "dealer_base"    Sockel (Topf) für ULN2003 + Schrittmotor   (1x)
+//    + 1x gate, 1x motor_bracket, 1x wheel, 1x weight zusätzlich
+//
 //  Koordinaten (für das linke Modul): X = Vorschubrichtung (zur Mitte),
 //  Y = Längsseite der Karte, Z = oben. Das rechte Modul ist dasselbe Teil,
 //  nur um 180° gedreht.
@@ -119,7 +129,7 @@ module nut_trap(h=m3_nut_h) {
 // ============================================================================
 //  Kartenschacht (2x drucken, Boden nach unten, keine Stützen nötig)
 // ============================================================================
-module tray() {
+module tray(sensor=false) {
   difference() {
     union() {
       // Boden
@@ -136,6 +146,8 @@ module tray() {
     }
     // Schlitz für das Reibrad
     translate([x_w - 12, y_w - wheel_w/2 - 1.5, -1]) rcube([24, wheel_w + 3, floor_t + 2], 1.5);
+    // Dealer: Fenster für TCRT5000-Reflexsensor (erkennt "Magazin leer")
+    if (sensor) translate([tcrt_x - tcrt_a/2, tcrt_y - tcrt_b/2, -1]) cube([tcrt_a, tcrt_b, floor_t + 2]);
     // Senkschrauben für den Motorhalter
     for (dx = [-br_ear, br_ear])
       translate([x_w + dx, y_face - bracket_len/2, 0]) countersink_m3(floor_t);
@@ -223,24 +235,24 @@ module wheel() {
 function peg_pos() = [[post/2, post/2], [post/2, tray_y - post/2],
                       [tray_x - post/2 - 2, post/2], [tray_x - post/2 - 2, tray_y - post/2]];
 
-module side_box(elec=false) {
+module side_box(elec=false, h=box_h, bf=box_floor, joins=true, vent=true) {
   difference() {
     union() {
       difference() {
-        cube([tray_x, tray_y, box_h]);
-        translate([wall, wall, box_floor]) cube([tray_x - 2*wall, tray_y - 2*wall, box_h]);
+        cube([tray_x, tray_y, h]);
+        translate([wall, wall, bf]) cube([tray_x - 2*wall, tray_y - 2*wall, h]);
       }
       // Eck-Säulen
-      for (p = peg_pos()) translate([p[0] - post/2, p[1] - post/2, 0]) cube([post, post, box_h]);
+      for (p = peg_pos()) translate([p[0] - post/2, p[1] - post/2, 0]) cube([post, post, h]);
       // Zentrierstifte
-      for (p = peg_pos()) translate([p[0], p[1], box_h]) cylinder(d=peg_d, h=peg_h);
+      for (p = peg_pos()) translate([p[0], p[1], h]) cylinder(d=peg_d, h=peg_h);
     }
     // Verbindung zum Ausgabefach (Stirnseite X = tray_x)
-    for (y = join_y) translate([tray_x - 20, y, join_z]) rotate([0,90,0]) cylinder(d=m3_clear, h=30);
+    if (joins) for (y = join_y) translate([tray_x - 20, y, join_z]) rotate([0,90,0]) cylinder(d=m3_clear, h=30);
     // Kabeldurchführung zum Ausgabefach / zur anderen Seite
     translate([tray_x - wall - 1, tray_y/2 - 8, box_floor + 3]) cube([wall + 2, 16, 8]);
     // Lüftung/Gewicht sparen im Boden
-    translate([tray_x/2, tray_y/2, -1]) cylinder(d=30, h=box_floor + 2);
+    if (vent) translate([tray_x/2, tray_y/2, -1]) cylinder(d=30, h=bf + 2);
     if (elec) {
       // Rückwand (X=0): USB-Buchse Nano + DC-Hohlbuchse 5,5x2,1
       translate([-1, 30, box_floor + 4]) cube([wall + 2, 12, 8]);       // USB Mini/USB-C
@@ -297,6 +309,128 @@ module weight() {
   }
 }
 
+
+// ============================================================================
+//  AUSTEIL-MODUL ("Dealer")
+// ============================================================================
+//  Aufbau von unten nach oben:
+//    dealer_base   Topf mit Schrittmotor-Treiber (ULN2003)
+//    dealer_lid    Deckel, an dem der 28BYJ-48-Schrittmotor hängt
+//    Lazy-Susan-Kugellager 75 mm (Kaufteil) zwischen Deckel und Drehkasten
+//    dealer_box    drehender Kasten mit Nabe auf der Motorwelle
+//    tray_dealer   Kartenmagazin = Schacht mit Fenster für TCRT5000
+//    + gate, motor_bracket, wheel und weight wie beim Mischer
+//  Der Auswurf-Motor ist ein SCHNELLER N20 (1000-1500 U/min).
+
+// Sensor im Magazinboden (TCRT5000, Bauteil 10,2 x 5,8 mm)
+tcrt_a = 6.2;  tcrt_b = 10.6;
+tcrt_x = gate_x - 8;            // kurz vor dem Gate, unter der untersten Karte
+tcrt_y = y_w + 20;              // neben dem Rad
+
+// Drehachse unter der Kartenmitte (Koordinaten Schacht/Kasten)
+ax_x = wall + in_x/2;
+ax_y = y_in0 + in_y/2;
+
+dbox_h     = 22;                // Höhe Drehkasten (Motorhalter hängt hinein)
+dbox_floor = 3;
+susan_h    = 8;                 // Bauhöhe Lazy-Susan-Lager
+susan_hole = 30;                // min. freier Innendurchmesser des Lagers
+
+// 28BYJ-48
+byj_off    = 8;                 // Welle sitzt 8 mm neben Gehäusemitte
+byj_body_d = 28.5;
+byj_ear    = 35;                // Lochabstand der Laschen
+byj_shaft  = 5.1;  byj_flat = 3.1;
+hub_len    = susan_h - 1.5;     // Nabe greift ~5,5 mm auf die Welle
+
+base_d     = 100;
+base_h     = 38;
+lid_t      = 3;
+lid_screw_r= 42;
+
+module dealer_box() {
+  difference() {
+    side_box(elec=false, h=dbox_h, bf=dbox_floor, joins=false, vent=false);
+    // Senkschrauben für die Nabe
+    for (a = [90:120:359]) translate([ax_x + hub_scr_r*cos(a), ax_y + hub_scr_r*sin(a), dbox_floor])
+      rotate([180,0,0]) countersink_m3(dbox_floor);
+    // Fenster für Sensor-/Motorkabel hinten
+    translate([-1, tray_y/2 - 8, dbox_floor + 2]) cube([wall + 2, 16, 8]);
+  }
+}
+
+// Nabe (separat, damit der Kasten ohne Stützen druckbar ist): Flansch wird mit
+// 3x M3x10 Senkkopf von innen durch den Kastenboden geschraubt.
+hub_flange_d = 26;  hub_flange_t = 5;  hub_scr_r = 9.5;
+module dealer_hub() {
+  // Ursprung = Unterseite Kastenboden, Nabe zeigt nach -Z
+  difference() {
+    union() {
+      translate([0, 0, -hub_flange_t]) cylinder(d=hub_flange_d, h=hub_flange_t);
+      translate([0, 0, -hub_len]) cylinder(d=12, h=hub_len);
+    }
+    translate([0, 0, -hub_len - 1]) intersection() {
+      cylinder(d=byj_shaft, h=hub_len + 0.5);
+      translate([-byj_flat/2, -5, 0]) cube([byj_flat, 10, hub_len + 5]);
+    }
+    for (a = [90:120:359]) translate([hub_scr_r*cos(a), hub_scr_r*sin(a), -hub_flange_t - 0.01])
+      cylinder(d=m3_tap, h=hub_flange_t + 0.02);
+  }
+}
+
+module dealer_lid() {
+  difference() {
+    cylinder(d=base_d, h=lid_t);
+    // Wellen-Boss
+    translate([0, 0, -1]) cylinder(d=10, h=lid_t + 2);
+    // Laschen des Schrittmotors (Gehäusemitte bei y = -byj_off)
+    // (Senkkopf, damit das Lazy-Susan-Lager plan aufliegt)
+    for (x = [-byj_ear/2, byj_ear/2]) translate([x, -byj_off, 0]) countersink_m3(lid_t);
+    // Deckelschrauben
+    for (a = [45:90:359]) translate([lid_screw_r*cos(a), lid_screw_r*sin(a), -1]) countersink_m3(lid_t + 1);
+    // Markierung "Spieler 1 / Ausgang" (Kerbe)
+    translate([base_d/2 - 3, -1, lid_t - 1]) cube([4, 2, 2]);
+  }
+}
+
+module dealer_base() {
+  difference() {
+    union() {
+      difference() {
+        cylinder(d=base_d, h=base_h);
+        translate([0, 0, 2]) cylinder(d=base_d - 2*wall, h=base_h);
+      }
+      for (a = [45:90:359]) translate([lid_screw_r*cos(a), lid_screw_r*sin(a), 0]) cylinder(d=9, h=base_h);
+    }
+    for (a = [45:90:359]) translate([lid_screw_r*cos(a), lid_screw_r*sin(a), base_h - 12]) cylinder(d=m3_tap, h=13);
+    // Kabelausgang zum Mischer (hinten)
+    translate([-base_d/2 - 1, 0, 8]) rotate([0, 90, 0]) cylinder(d=9, h=10);
+    // Ausrichtungskerbe vorn ("Spieler 1")
+    translate([base_d/2 - 1.5, 0, base_h - 4]) cylinder(d=3, h=5, $fn=3);
+  }
+}
+
+module dealer_assembly() {
+  color("SlateGray") dealer_base();
+  color("LightSlateGray") translate([0, 0, base_h]) dealer_lid();
+  color("Silver", 0.6) translate([-37.5, -37.5, base_h + lid_t]) cube([75, 75, susan_h]);   // Lazy Susan
+  translate([-ax_x, -ax_y, base_h + lid_t + susan_h]) {
+    color("SteelBlue") dealer_box();
+    color("Black") translate([ax_x, ax_y, 0]) dealer_hub();
+    translate([0, 0, dbox_h]) {
+      color("LightGray") tray(sensor=true);
+      color("Orange") translate([gate_x, 0, floor_t + gate_gap]) rotate([90,0,90]) gate();
+      color("DimGray") translate([x_w, y_face, 0]) motor_bracket();
+      color("Black") translate([x_w, y_face + hub_offset, z_w]) rotate([-90,0,0]) wheel();
+      color("Gold", 0.8) translate([wall + 3, y_in0 + 4, floor_t + 10]) weight();
+      color("White") translate([wall + 0.5, y_in0 + 1.5, floor_t]) cube([card_w, card_l, 8]);
+    }
+  }
+  // fliegende Karte (Andeutung)
+  color("White") translate([tray_x - ax_x + 30, -card_l/2, base_h + lid_t + susan_h + dbox_h + 2])
+    rotate([0, -3, 0]) cube([card_w, card_l, 0.4]);
+}
+
 // ============================================================================
 //  Zusammenbau-Ansicht
 // ============================================================================
@@ -331,3 +465,10 @@ else if (PART == "side_box")      side_box(false);
 else if (PART == "side_box_elec") side_box(true);
 else if (PART == "well")          well();
 else if (PART == "weight")        weight();
+else if (PART == "dealer")        dealer_assembly();
+else if (PART == "everything")    { assembly(); translate([tray_x + well_x/2, -150, 0]) dealer_assembly(); }
+else if (PART == "tray_dealer")   tray(sensor=true);
+else if (PART == "dealer_box")    dealer_box();
+else if (PART == "dealer_hub")    rotate([180,0,0]) dealer_hub();
+else if (PART == "dealer_lid")    dealer_lid();
+else if (PART == "dealer_base")   dealer_base();

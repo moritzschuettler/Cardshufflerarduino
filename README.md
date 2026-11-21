@@ -1,11 +1,18 @@
-# Arduino Poker-Kartenmischer
+# Arduino Poker-Kartenmischer + Austeil-Roboter
 
 Ein automatischer 2-Schacht-Kartenmischer ("Riffle-Shuffler") mit Arduino, zwei
 N20-Getriebemotoren und 3D-gedrucktem Gehäuse. Das Deck wird halbiert, links und
 rechts eingelegt, und die Maschine lässt die Karten in zufälliger Reihenfolge
 einzeln in das mittlere Fach fallen. So funktioniert auch ein echter Riffle-Shuffle.
 
-![Gesamtansicht](docs/assembly.png)
+![Gesamtansicht](docs/everything.png)
+
+Das Projekt besteht aus zwei Modulen, die an **einem** Arduino hängen:
+
+- **Mischer:** zwei Schächte und ein Ausgabefach (Abschnitte 1–10)
+- **Austeil-Modul (Dealer):** ein Drehkasten auf einem Schrittmotor. Er dreht sich zu
+  jedem Spieler und wirft ihm die Karten zu (Abschnitt **13**). Das Modul ist
+  optional: Ohne Dealer setzt du im Code `DEALER_ENABLED = false`.
 
 ```
    Schacht LINKS             Ausgabefach            Schacht RECHTS
@@ -57,7 +64,7 @@ Durchgang die Anzahl der bisherigen Durchgänge.
 | 1 | Passiver Piezo-Buzzer | optional | 0,50 |
 | 1 | Kippschalter 6 mm (Ein/Aus) | optional | 1 |
 | 1 | DC-Einbaubuchse 5,5 × 2,1 mm | | 1 |
-| 1 | **Netzteil 5 V / 2 A** mit 5,5 × 2,1-Stecker | alternativ USB-Netzteil über den Nano | 6–10 |
+| 1 | **Netzteil 5 V / 2 A** (mit Dealer: **5 V / 3 A**) mit 5,5 × 2,1-Stecker | alternativ USB-Netzteil über den Nano | 6–10 |
 | 1 | Elko 470 µF / 16 V | an VM des Motortreibers | 0,30 |
 | 1 | Elko 100 µF / 16 V (oder 10 µF) | an 5 V / GND am Nano | 0,20 |
 | – | Lochrasterplatine ca. 5 × 7 cm, Stiftleisten, Dupont-Kabel, Litze | | 3 |
@@ -118,7 +125,8 @@ Alle Teile stehen im parametrischen OpenSCAD-Modell
 ```bash
 # alle Teile als STL exportieren
 cd cad
-for p in tray gate motor_bracket wheel side_box side_box_elec well weight; do
+for p in tray gate motor_bracket wheel side_box side_box_elec well weight \
+         tray_dealer dealer_box dealer_hub dealer_lid dealer_base; do
   openscad -D "PART=\"$p\"" -o stl/$p.stl card_shuffler.scad
 done
 ```
@@ -358,7 +366,7 @@ Statt eines fertigen Break-Beam-Sensors:
 ├── firmware/CardShuffler/
 │   └── CardShuffler.ino            ← Arduino-Code
 ├── cad/
-│   ├── card_shuffler.scad          ← parametrisches CAD-Modell (OpenSCAD)
+│   ├── card_shuffler.scad          ← parametrisches CAD-Modell (OpenSCAD), Mischer + Dealer
 │   └── stl/                        ← fertige Druckdateien
 └── docs/                           ← Vorschaubilder
 ```
@@ -370,3 +378,125 @@ Statt eines fertigen Break-Beam-Sensors:
   wieder in die Schächte verteilt (deutlich aufwendiger)
 - **Hall-Sensor / Reed-Kontakt** im Gewicht, um "Schacht leer" schneller zu erkennen
 - **Akku-Betrieb** mit 18650-Zelle und 5-V-Boost-Modul (≥ 2 A)
+
+---
+
+## 13. Austeil-Modul (Dealer)
+
+![Dealer](docs/dealer.png)
+
+### 13.1 Funktionsweise
+
+Der Dealer steht in der **Tischmitte**. Nach dem Mischen setzt du den Stapel aus dem
+Ausgabefach in das Magazin des Dealers. Taster 2 lang drücken, dann passiert Folgendes:
+
+1. Der **28BYJ-48-Schrittmotor** dreht den Kasten zu Spieler 1.
+2. Ein **schneller N20-Motor** (1000–1500 U/min) mit dem gleichen Reibrad wie beim
+   Mischer schießt die unterste Karte durch das Gate über den Tisch.
+3. Der Kasten dreht zum nächsten Spieler, und so weiter. Nach jeder Runde fährt er
+   zurück auf die Startposition, damit sich das Kabel nicht aufwickelt.
+4. Ein **TCRT5000**-Reflexsensor im Magazinboden erkennt, ob noch Karten da sind.
+
+Die Spieler sind standardmäßig **gleichmäßig im Kreis** verteilt (`DEAL_ARC_DEG = 360`).
+Sitzen alle auf einer Tischseite, stellst du z. B. `DEAL_ARC_DEG = 180` ein.
+
+### 13.2 Zusätzliche Einkaufsliste
+
+| Anz. | Teil | Hinweis | ca. € |
+|---:|---|---|---:|
+| 1 | **28BYJ-48 Schrittmotor 5 V + ULN2003-Treiberplatine** | meist im Set | 3–5 |
+| 1 | **N20-Getriebemotor 6 V, 1000–1500 U/min** | schnell, für den Kartenwurf | 4 |
+| 1 | 2. **TB6612FNG** | nur Kanal A wird genutzt | 3–6 |
+| 1 | **TCRT5000-Modul** (mit LM393-Komparator und Poti) | Sensor für "Magazin leer" | 1 |
+| 1 | **Lazy-Susan-Drehlager 75 mm (3 Zoll)**, Kugellager-Drehteller | trägt den Drehkasten | 3–5 |
+| 1 | Taster (2. Taster "Austeilen") + Widerstand 10 kΩ | | 1 |
+| 2 | O-Ring 22 × 3 mm | fürs Reibrad | – |
+| 3 | M3 × 10 Senkkopf | Nabe → Drehkasten | – |
+| 2 | M3 × 8 Senkkopf + Mutter | Schrittmotor → Deckel | – |
+| 4 | M3 × 8 Senkkopf | Deckel → Sockel | – |
+| 4–8 | Holzschrauben 3 × 10 oder Sekundenkleber | Lazy-Susan-Lager befestigen | – |
+| ca. 1 m | 6-adriges flexibles Kabel (z. B. Flachband, Lautsprecherlitze) | Verbindung zum Mischer | 2 |
+
+### 13.3 Zusätzliche Druckteile
+
+| Teil | STL | Anz. | Ausrichtung |
+|---|---|---:|---|
+| Kartenmagazin mit Sensorfenster | `tray_dealer.stl` | 1 | Boden unten |
+| Drehkasten | `dealer_box.stl` | 1 | Boden unten |
+| Nabe | `dealer_hub.stl` | 1 | Flansch unten (wie exportiert) |
+| Deckel | `dealer_lid.stl` | 1 | flach |
+| Sockel | `dealer_base.stl` | 1 | Boden unten |
+| Gate-Platte | `gate.stl` | +1 | flach |
+| Motorhalter | `motor_bracket.stl` | +1 | stehend |
+| Reibrad | `wheel.stl` | +1 | flach |
+| Andruckgewicht | `weight.stl` | +1 | Öffnung oben |
+
+Insgesamt brauchst du also **3×** Gate, Motorhalter, Reibrad und Gewicht.
+
+### 13.4 Verkabelung Dealer
+
+| Arduino Nano | Verbunden mit |
+|---|---|
+| D3 (PWM) | TB6612 #2 **PWMA** |
+| A1 | TB6612 #2 **AIN2** |
+| 5V | TB6612 #2 **AIN1** (fest), **VCC**, **VM**, **STBY** (oder STBY an D4) |
+| A2, A3, A4, A5 | ULN2003 **IN1, IN2, IN3, IN4** |
+| A6 | TCRT5000 **DO** (A6 ist beim Nano nur analog lesbar, das ist im Code berücksichtigt) |
+| A7 | Taster 2 → GND, **plus 10 kΩ von A7 nach 5V** (A6/A7 haben keinen internen Pull-up) |
+| 5V / GND | ULN2003 (+ / –), TCRT5000 (VCC / GND) |
+
+TB6612 #2 **AO1/AO2** gehen an den schnellen N20-Motor. Läuft er falsch herum, tauschst
+du die beiden Motorkabel. Wichtig: Der **Arduino Uno** hat kein A6/A7. Für den Dealer
+brauchst du also einen **Nano** (oder du passt die Pins an).
+
+### 13.5 Zusammenbau Dealer
+
+1. **Schrittmotor** von unten an den Deckel (`dealer_lid`) schrauben (2 × M3-Senkkopf
+   von oben, Mutter unten). Die Welle schaut durch das mittlere Loch nach oben.
+2. **ULN2003-Platine** in den Sockel legen (Doppelklebeband), Motorstecker einstecken,
+   Kabel durch das Loch hinten führen. Deckel mit 4 × M3 auf den Sockel schrauben.
+3. **Lazy-Susan-Lager** mittig auf den Deckel setzen und festschrauben oder kleben. Die
+   Welle muss frei durch die Mitte des Lagers ragen.
+4. **Nabe** (`dealer_hub`) mit 3 × M3 × 10 Senkkopf von innen an den Boden des
+   Drehkastens schrauben.
+5. Drehkasten mit der Nabe auf die Welle stecken und mit der Oberseite des Lagers
+   verschrauben oder verkleben. Der Kasten muss sich mit dem Motor leicht drehen lassen.
+6. **Kartenmagazin** wie einen Mischer-Schacht aufbauen: Motorhalter mit dem
+   **schnellen** N20, Reibrad und Gate. Den **TCRT5000** von unten in das rechteckige
+   Fenster im Boden kleben. Die Sensoroberfläche sitzt ca. 0,5 mm unter der
+   Bodenoberseite.
+7. Magazin auf den Drehkasten setzen (Zentrierstifte). Motor- und Sensorkabel als
+   **lockere Schlaufe** (ca. 25 cm) aus dem Fenster hinten zum Kabelloch im Sockel führen.
+   Der Kasten dreht maximal ca. 315° und dann wieder zurück.
+8. Startposition: Der **Auswurf zeigt auf die Kerbe am Sockel**. Stell den Dealer so
+   auf, dass die Kerbe auf Spieler 1 zeigt (links vom Geber).
+
+### 13.6 Einstellen
+
+| Befehl / Konstante | Bedeutung |
+|---|---|
+| `w` | Drehtest: eine Umdrehung hin und zurück. Läuft er falsch herum: `STEP_REVERSE = true` |
+| `z` | zeigt, ob der Sensor eine Karte sieht. Empfindlichkeit am blauen Poti des TCRT5000 einstellen |
+| `e` | eine einzelne Karte werfen |
+| `p6`, `k2` | 6 Spieler, 2 Karten pro Spieler (wird im EEPROM gespeichert) |
+| `d` | Austeilen |
+| `DEAL_POWER` | Wurfkraft (PWM). Fliegen die Karten zu weit, Wert verringern |
+| `DEAL_PULSE_MS` | Laufzeit pro Wurf. Kommen 2 Karten: kleiner. Bleibt die Karte im Gate hängen: größer |
+| `DEAL_ARC_DEG` | 360 = rundherum, 180 = Halbkreis |
+| `STEPS_PER_REV` | 4096. Wenn eine Umdrehung nicht genau 360° ergibt: manche 28BYJ-48 haben 4076 |
+
+### 13.7 Bedienung Dealer
+
+- **Taster 2 kurz:** Spielerzahl +1 (2 bis 10, danach wieder 2). Die LED blinkt die
+  Anzahl.
+- **Taster 2 lang (> 1 s):** austeilen.
+- **Taster 1 während des Austeilens:** Abbruch. Der Kasten fährt zurück auf die
+  Startposition.
+
+Typischer Ablauf eines Pokerabends:
+
+```
+Karten in beide Schächte → Taster 1 (mischen) → 3–4× wiederholen
+→ Stapel ins Dealer-Magazin → Taster 2 lang (austeilen)
+→ restlichen Stapel für Flop/Turn/River neben den Dealer legen
+```

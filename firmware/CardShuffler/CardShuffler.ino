@@ -28,12 +28,21 @@
  *        s = Mischen starten        l = 1 Karte links   r = 1 Karte rechts
  *        t = Sensortest (5 s)       m = Motortest       h = Hilfe
  *
+ *  AUSTEIL-MODUL (Dealer, optional):
+ *    Drehkasten auf 28BYJ-48-Schrittmotor, schneller N20-Motor wirft die
+ *    unterste Karte aus, TCRT5000 erkennt "Magazin leer".
+ *    - Taster 2 kurz            -> Spielerzahl +1 (LED blinkt die Anzahl)
+ *    - Taster 2 lang (>1 s)     -> Austeilen
+ *    - Seriell: d = austeilen, p6 = 6 Spieler, k2 = 2 Karten pro Spieler
+ *
  *  Empfehlung: 3–4 Durchgänge (Karten aus dem Ausgabefach wieder teilen und
  *  neu einlegen). Mathematisch gelten ~7 Riffle-Shuffles als "voll gemischt"
  *  (Bayer & Diaconis); 4 Maschinen-Durchgänge + 1x Abheben sind für
  *  Heimspiele mehr als ausreichend.
  * ===========================================================================
  */
+
+#include <EEPROM.h>
 
 // ------------------------------- PINS ---------------------------------------
 // TB6612FNG
@@ -77,6 +86,29 @@ const bool     INVERT_RIGHT       = false;
 
 const uint16_t LONG_PRESS_MS      = 2000;
 
+// ============================ AUSTEIL-MODUL ==================================
+// Zweiter TB6612FNG (nur Kanal A): AIN1 fest an 5V, STBY an D4 (gemeinsam).
+const uint8_t PIN_DEAL_PWM   = 3;   // PWMA (2. Treiber)
+const uint8_t PIN_DEAL_IN2   = A1;  // AIN2: LOW = vorwärts, HIGH = Bremse
+// 28BYJ-48 über ULN2003 (IN1..IN4)
+const uint8_t PIN_STEP[4]    = { A2, A3, A4, A5 };
+const uint8_t PIN_DEAL_SENS  = A6;  // TCRT5000 DO (Nano: A6 ist NUR analog!)
+const uint8_t PIN_BUTTON2    = A7;  // Taster "Austeilen" gegen GND + 10k nach 5V
+
+const bool     DEALER_ENABLED   = true;   // false, wenn kein Dealer gebaut ist
+const uint8_t  DEAL_POWER       = 255;    // PWM Auswurf (Wurfweite!)
+const uint16_t DEAL_PULSE_MS    = 70;     // Motorlaufzeit pro Karte
+const uint16_t DEAL_PAUSE_MS    = 150;    // Pause nach dem Wurf
+const uint16_t DEAL_ARC_DEG     = 360;    // 360 = Spieler rundherum verteilt,
+                                          // z.B. 180 = Halbkreis (Tischseite)
+const int16_t  STEPS_PER_REV    = 4096;   // 28BYJ-48 im Halbschritt
+const bool     STEP_REVERSE     = false;  // Drehrichtung umkehren
+const uint16_t STEP_US_FAST     = 1100;   // min. µs pro Halbschritt
+const uint16_t STEP_US_SLOW     = 2500;   // Startgeschwindigkeit (Rampe)
+const uint16_t RAMP_STEPS       = 200;
+const bool     DEAL_SENS_LOW_IS_CARD = true; // TCRT5000-Modul: LOW = Karte da
+const uint8_t  MAX_PLAYERS      = 10;
+
 // ------------------------------- TYPEN --------------------------------------
 enum Side : uint8_t { LEFT = 0, RIGHT = 1 };
 enum FeedResult : uint8_t { FEED_OK, FEED_EMPTY, FEED_JAM, FEED_ABORT };
@@ -95,6 +127,10 @@ Tray trays[2] = {
 };
 
 uint8_t passCount = 0;
+uint8_t players = 6;          // wird aus dem EEPROM geladen
+uint8_t cardsPerPlayer = 2;   // Texas Hold'em = 2, Omaha = 4, Draw = 5
+int32_t stepPos = 0;          // aktuelle Position in Halbschritten
+uint8_t stepPhase = 0;
 volatile bool abortRequested = false;
 
 // --------------------------- HILFSFUNKTIONEN --------------------------------
@@ -337,6 +373,161 @@ void shufflePass() {
   blink(passCount, 250, 250);    // LED blinkt Anzahl der Durchgänge
 }
 
+// =========================== AUSTEILEN ======================================
+const uint8_t HALFSTEP[8] = { 0b0001, 0b0011, 0b0010, 0b0110,
+                              0b0100, 0b1100, 0b1000, 0b1001 };
+
+void stepperWrite(uint8_t pattern) {
+  for (uint8_t i = 0; i < 4; i++) digitalWrite(PIN_STEP[i], (pattern >> i) & 1);
+}
+
+void stepperRelease() { stepperWrite(0); }   // Spulen stromlos (kein Erhitzen)
+
+// Fährt auf eine absolute Position (Halbschritte) mit Anfahr-/Bremsrampe
+bool stepperMoveTo(int32_t target) {
+  int32_t dist = target - stepPos;
+  int8_t dir = dist >= 0 ? 1 : -1;
+  int32_t n = labs(dist);
+  for (int32_t i = 0; i < n; i++) {
+    if (checkAbort()) return false;
+    int32_t edge = min(i, n - 1 - i);               // Abstand zu Start/Ziel
+    uint16_t us = STEP_US_FAST;
+    if (edge < RAMP_STEPS)
+      us = STEP_US_SLOW - (uint32_t)(STEP_US_SLOW - STEP_US_FAST) * edge / RAMP_STEPS;
+    int8_t d = STEP_REVERSE ? -dir : dir;
+    stepPhase = (stepPhase + 8 + d) & 7;
+    stepperWrite(HALFSTEP[stepPhase]);
+    stepPos += dir;
+    delayMicroseconds(us);
+  }
+  return true;
+}
+
+int32_t angleToSteps(uint16_t deg) {
+  return (int32_t)deg * STEPS_PER_REV / 360;
+}
+
+// Winkel für Spieler i (0 = vor dem Auswurf bei Startposition)
+uint16_t playerAngle(uint8_t i) {
+  if (DEAL_ARC_DEG >= 360) return (uint32_t)360 * i / players;
+  if (players < 2) return 0;
+  return (uint32_t)DEAL_ARC_DEG * i / (players - 1);
+}
+
+bool dealerHasCard() {
+  bool low = analogRead(PIN_DEAL_SENS) < 512;
+  return DEAL_SENS_LOW_IS_CARD ? low : !low;
+}
+
+void dealMotorBrake() {
+  digitalWrite(PIN_DEAL_IN2, HIGH);   // AIN1 fest HIGH -> HIGH/HIGH = Bremse
+  analogWrite(PIN_DEAL_PWM, 255);
+}
+
+void dealMotorOff() {
+  analogWrite(PIN_DEAL_PWM, 0);
+  digitalWrite(PIN_DEAL_IN2, HIGH);
+}
+
+// Eine Karte werfen. false = Magazin leer
+bool dealOneCard() {
+  if (!dealerHasCard()) return false;
+  digitalWrite(PIN_DEAL_IN2, LOW);
+  analogWrite(PIN_DEAL_PWM, DEAL_POWER);
+  delay(DEAL_PULSE_MS);
+  dealMotorBrake();
+  delay(DEAL_PAUSE_MS);
+  dealMotorOff();
+  return true;
+}
+
+void dealRound() {
+  if (!DEALER_ENABLED) { Serial.println(F("Dealer deaktiviert.")); return; }
+  abortRequested = false;
+  while (buttonPressed() || analogRead(PIN_BUTTON2) < 300) delay(5);
+
+  uint16_t need = (uint16_t)players * cardsPerPlayer;
+  Serial.print(F("\n== Austeilen: ")); Serial.print(players);
+  Serial.print(F(" Spieler x ")); Serial.print(cardsPerPlayer);
+  Serial.print(F(" Karten = ")); Serial.println(need);
+
+  if (!dealerHasCard()) {
+    Serial.println(F("!! Magazin leer."));
+    beep(400, 200); beep(400, 200);
+    return;
+  }
+
+  digitalWrite(PIN_LED, HIGH);
+  beep(1800, 60);
+  bool ok = true;
+
+  for (uint8_t c = 0; c < cardsPerPlayer && ok; c++) {
+    for (uint8_t p = 0; p < players && ok; p++) {
+      if (!stepperMoveTo(angleToSteps(playerAngle(p)))) { ok = false; break; }
+      delay(40);                                  // ausschwingen lassen
+      if (!dealOneCard()) {
+        Serial.println(F("!! Magazin vorzeitig leer."));
+        ok = false;
+        for (uint8_t i = 0; i < 3; i++) { beep(400, 250); delay(100); }
+        break;
+      }
+    }
+    // zurück zum Start (Kabel wickelt sich wieder ab)
+    if (ok && !stepperMoveTo(0)) ok = false;
+  }
+
+  abortRequested = false;
+  stepperMoveTo(0);
+  stepperRelease();
+  dealMotorOff();
+  digitalWrite(PIN_LED, LOW);
+  if (ok) { Serial.println(F("== Ausgeteilt ==")); beep(2000, 80); beep(2600, 120); }
+  else      Serial.println(F("== Austeilen abgebrochen =="));
+}
+
+void saveSettings() {
+  EEPROM.update(0, 0xA5);
+  EEPROM.update(1, players);
+  EEPROM.update(2, cardsPerPlayer);
+}
+
+void loadSettings() {
+  if (EEPROM.read(0) != 0xA5) return;
+  uint8_t p = EEPROM.read(1), k = EEPROM.read(2);
+  if (p >= 2 && p <= MAX_PLAYERS) players = p;
+  if (k >= 1 && k <= 9) cardsPerPlayer = k;
+}
+
+void printDealSettings() {
+  Serial.print(F("Spieler: ")); Serial.print(players);
+  Serial.print(F("   Karten pro Spieler: ")); Serial.println(cardsPerPlayer);
+}
+
+// Taster 2: kurz = Spielerzahl +1 (2..MAX), lang = Austeilen
+void handleButton2() {
+  if (analogRead(PIN_BUTTON2) >= 300) return;
+  unsigned long t0 = millis();
+  while (analogRead(PIN_BUTTON2) < 300 && millis() - t0 < 1000) delay(5);
+  if (millis() - t0 < 30) return;                 // Prellen
+  if (millis() - t0 >= 1000) {
+    dealRound();
+  } else {
+    players = (players >= MAX_PLAYERS) ? 2 : players + 1;
+    saveSettings();
+    printDealSettings();
+    blink(players, 120, 120);
+  }
+}
+
+void stepperTest() {
+  Serial.println(F("Drehtest: eine Umdrehung vor und zurueck"));
+  abortRequested = false;
+  stepperMoveTo(STEPS_PER_REV);
+  delay(300);
+  stepperMoveTo(0);
+  stepperRelease();
+}
+
 // ------------------------- TEST-FUNKTIONEN ----------------------------------
 void sensorTest() {
   Serial.println(F("Sensortest 5 s: Karte durch die Lichtschranke fallen lassen..."));
@@ -386,6 +577,10 @@ void printHelp() {
   Serial.println(F("  t  Sensortest (5 s)"));
   Serial.println(F("  m  Motortest"));
   Serial.println(F("  0  Durchgangszaehler zuruecksetzen"));
+  Serial.println(F("  d  Austeilen starten"));
+  Serial.println(F("  p4 Spielerzahl setzen (2-10), z.B. p6"));
+  Serial.println(F("  k2 Karten pro Spieler (1-9), z.B. k5"));
+  Serial.println(F("  w  Drehtest Dealer   e  eine Karte werfen   z  Dealer-Sensor"));
   Serial.println(F("  h  Hilfe"));
 }
 
@@ -398,6 +593,12 @@ void setup() {
     pinMode(trays[i].in2, OUTPUT);
   }
   pinMode(PIN_SENSOR, INPUT_PULLUP);
+  pinMode(PIN_DEAL_PWM, OUTPUT);
+  pinMode(PIN_DEAL_IN2, OUTPUT);
+  for (uint8_t i = 0; i < 4; i++) pinMode(PIN_STEP[i], OUTPUT);
+  dealMotorOff();
+  stepperRelease();
+  loadSettings();
   pinMode(PIN_BUTTON, INPUT_PULLUP);
   pinMode(PIN_LED, OUTPUT);
   pinMode(PIN_BUZZER, OUTPUT);
@@ -408,6 +609,7 @@ void setup() {
   Serial.begin(115200);
   Serial.println(F("Kartenmischer bereit."));
   printHelp();
+  printDealSettings();
 
   blink(2, 80, 80);
   beep(1500, 50);
@@ -431,6 +633,9 @@ void loop() {
     }
   }
 
+  // --- Taster 2 (Dealer) ---
+  if (DEALER_ENABLED) handleButton2();
+
   // --- Serielle Befehle ---
   if (Serial.available()) {
     char c = Serial.read();
@@ -442,6 +647,22 @@ void loop() {
       case 'm': motorTest();        break;
       case '0': passCount = 0; Serial.println(F("Zaehler = 0")); break;
       case 'h': printHelp();        break;
+      case 'd': dealRound();        break;
+      case 'w': stepperTest();      break;
+      case 'e': Serial.println(dealOneCard() ? F("Karte geworfen") : F("Magazin leer"));
+                dealMotorOff(); break;
+      case 'z': Serial.println(dealerHasCard() ? F("Dealer: Karte im Magazin") : F("Dealer: leer"));
+                break;
+      case 'p': {
+        int v = Serial.parseInt();
+        if (v >= 2 && v <= MAX_PLAYERS) { players = v; saveSettings(); }
+        printDealSettings();
+      } break;
+      case 'k': {
+        int v = Serial.parseInt();
+        if (v >= 1 && v <= 9) { cardsPerPlayer = v; saveSettings(); }
+        printDealSettings();
+      } break;
       default: break;
     }
   }
