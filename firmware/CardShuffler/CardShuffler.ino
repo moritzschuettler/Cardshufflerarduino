@@ -16,24 +16,26 @@
  *      Shuffles) zufällig bestimmt:  P(links) = Karten_links / Karten_gesamt.
  *
  *  Hardware (siehe README.md):
- *    Arduino Nano / Uno, TB6612FNG Motortreiber, 2x N20-Motor 6V,
- *    1x IR-Lichtschranke 5 mm (Sender + Empfänger), 1x Taster, 1x LED,
+ *    Arduino Nano, 2x TB6612FNG, 3x N20-Motor 6V, NEMA 17 + A4988/TMC2208,
+ *    SG90-Servo, IR-Lichtschranke 5 mm, TCRT5000, 2x Taster, 1x LED,
  *    optional: passiver Buzzer.
  *
  *  Bedienung:
  *    - Taster kurz drücken      -> Mischen starten (ein Durchgang)
  *    - Taster während Mischen   -> Abbruch
- *    - Taster lang (>2 s)       -> Zähler der Durchgänge zurücksetzen
  *    - Serieller Monitor 115200 Baud, Befehle:
  *        s = Mischen starten        l = 1 Karte links   r = 1 Karte rechts
  *        t = Sensortest (5 s)       m = Motortest       h = Hilfe
  *
- *  AUSTEIL-MODUL (Dealer, optional):
- *    Drehkasten auf 28BYJ-48-Schrittmotor, schneller N20-Motor wirft die
- *    unterste Karte aus, TCRT5000 erkennt "Magazin leer".
+ *  AUSTEILEN (Drehteller unter dem Mischer):
+ *    Die gemischten Karten fallen in das Magazin in der Mitte. Ein Servo-Arm
+ *    drückt auf den Stapel, ein schneller N20-Motor wirft die unterste Karte
+ *    nach vorne aus. Ein NEMA-17-Schrittmotor dreht die GANZE Maschine zum
+ *    jeweiligen Spieler. TCRT5000 im Magazinboden = "Magazin leer".
+ *    - Taster 1 lang (>1,5 s)   -> Mischen UND direkt Austeilen
  *    - Taster 2 kurz            -> Spielerzahl +1 (LED blinkt die Anzahl)
  *    - Taster 2 lang (>1 s)     -> Austeilen
- *    - Seriell: d = austeilen, p6 = 6 Spieler, k2 = 2 Karten pro Spieler
+ *    - Seriell: d = austeilen, a = mischen+austeilen, p6 = 6 Spieler, k2 = 2 Karten
  *
  *  Empfehlung: 3–4 Durchgänge (Karten aus dem Ausgabefach wieder teilen und
  *  neu einlegen). Mathematisch gelten ~7 Riffle-Shuffles als "voll gemischt"
@@ -43,6 +45,7 @@
  */
 
 #include <EEPROM.h>
+#include <Servo.h>
 
 // ------------------------------- PINS ---------------------------------------
 // TB6612FNG
@@ -58,7 +61,7 @@ const uint8_t PIN_BIN2  = 10;
 const uint8_t PIN_SENSOR = 2;  // IR-Lichtschranke Empfänger (Signal)
 const uint8_t PIN_BUTTON = 12; // Taster gegen GND (interner Pull-up)
 const uint8_t PIN_LED    = 13; // Status-LED (onboard LED reicht)
-const uint8_t PIN_BUZZER = 11; // optionaler passiver Buzzer (sonst frei lassen)
+const uint8_t PIN_BUZZER = A4; // optionaler passiver Buzzer
 const uint8_t PIN_NOISE  = A0; // UNBESCHALTET lassen -> Zufalls-Seed
 
 // ----------------------------- EINSTELLUNGEN --------------------------------
@@ -84,30 +87,37 @@ const uint8_t  SENSOR_DEBOUNCE    = 3;     // so viele gleiche Lesungen (~0,2 ms
 const bool     INVERT_LEFT        = false;
 const bool     INVERT_RIGHT       = false;
 
-const uint16_t LONG_PRESS_MS      = 2000;
+const uint16_t LONG_PRESS_MS      = 1500;
 
-// ============================ AUSTEIL-MODUL ==================================
+// ============================ AUSTEILEN ======================================
 // Zweiter TB6612FNG (nur Kanal A): AIN1 fest an 5V, STBY an D4 (gemeinsam).
-const uint8_t PIN_DEAL_PWM   = 3;   // PWMA (2. Treiber)
+const uint8_t PIN_DEAL_PWM   = 3;   // PWMA (2. Treiber) -> schneller N20 im Magazin
 const uint8_t PIN_DEAL_IN2   = A1;  // AIN2: LOW = vorwärts, HIGH = Bremse
-// 28BYJ-48 über ULN2003 (IN1..IN4)
-const uint8_t PIN_STEP[4]    = { A2, A3, A4, A5 };
-const uint8_t PIN_DEAL_SENS  = A6;  // TCRT5000 DO (Nano: A6 ist NUR analog!)
-const uint8_t PIN_BUTTON2    = A7;  // Taster "Austeilen" gegen GND + 10k nach 5V
+// NEMA 17 über A4988 / TMC2208 (EN fest an GND)
+const uint8_t PIN_STEP       = A2;
+const uint8_t PIN_DIR        = A3;
+const uint8_t PIN_DEAL_SENS  = A5;  // TCRT5000 DO: LOW = Karte im Magazin
+const uint8_t PIN_BUTTON2    = A6;  // Taster "Austeilen" gegen GND + 10k nach 5V (nur analog!)
+const uint8_t PIN_SERVO      = 11;  // SG90 Andruckarm
 
-const bool     DEALER_ENABLED   = true;   // false, wenn kein Dealer gebaut ist
+const bool     DEALER_ENABLED   = true;
 const uint8_t  DEAL_POWER       = 255;    // PWM Auswurf (Wurfweite!)
 const uint16_t DEAL_PULSE_MS    = 70;     // Motorlaufzeit pro Karte
-const uint16_t DEAL_PAUSE_MS    = 150;    // Pause nach dem Wurf
+const uint16_t DEAL_PAUSE_MS    = 120;    // Pause nach dem Wurf
 const uint16_t DEAL_ARC_DEG     = 360;    // 360 = Spieler rundherum verteilt,
                                           // z.B. 180 = Halbkreis (Tischseite)
-const int16_t  STEPS_PER_REV    = 4096;   // 28BYJ-48 im Halbschritt
+const int32_t  STEPS_PER_REV    = 3200;   // 200 Vollschritte x 16 Mikroschritte
 const bool     STEP_REVERSE     = false;  // Drehrichtung umkehren
-const uint16_t STEP_US_FAST     = 1100;   // min. µs pro Halbschritt
-const uint16_t STEP_US_SLOW     = 2500;   // Startgeschwindigkeit (Rampe)
-const uint16_t RAMP_STEPS       = 200;
-const bool     DEAL_SENS_LOW_IS_CARD = true; // TCRT5000-Modul: LOW = Karte da
+const uint16_t STEP_US_FAST     = 150;    // min. µs pro Mikroschritt (≈ 2 U/s)
+const uint16_t STEP_US_SLOW     = 900;    // Startgeschwindigkeit (Rampe)
+const uint16_t RAMP_STEPS       = 800;    // sanft anfahren: die Maschine ist schwer
 const uint8_t  MAX_PLAYERS      = 10;
+
+// Servo-Andruckarm (Winkel mit Befehl "s90" usw. ausprobieren und eintragen)
+const uint8_t  ARM_UP_DEG       = 10;     // Arm senkrecht oben (Mischen)
+const uint8_t  ARM_FULL_DEG     = 120;    // Arm liegt auf vollem Stapel (52 Karten)
+const uint8_t  ARM_EMPTY_DEG    = 150;    // Arm liegt auf leerem Magazinboden
+const uint8_t  ARM_PRESS_DEG    = 5;      // so viel "tiefer" kommandieren = Andruck
 
 // ------------------------------- TYPEN --------------------------------------
 enum Side : uint8_t { LEFT = 0, RIGHT = 1 };
@@ -129,8 +139,10 @@ Tray trays[2] = {
 uint8_t passCount = 0;
 uint8_t players = 6;          // wird aus dem EEPROM geladen
 uint8_t cardsPerPlayer = 2;   // Texas Hold'em = 2, Omaha = 4, Draw = 5
-int32_t stepPos = 0;          // aktuelle Position in Halbschritten
-uint8_t stepPhase = 0;
+int32_t stepPos = 0;          // aktuelle Position in Mikroschritten
+uint8_t cardsInMagazine = 0;  // Schätzung für den Andruckarm
+Servo   arm;
+void armUp();                 // Vorwärtsdeklaration
 volatile bool abortRequested = false;
 
 // --------------------------- HILFSFUNKTIONEN --------------------------------
@@ -265,8 +277,12 @@ void seedRandom() {
 }
 
 // ---------------------------- MISCHEN ---------------------------------------
+bool lastPassOk = false;
+
 void shufflePass() {
   abortRequested = false;
+  lastPassOk = false;
+  if (DEALER_ENABLED) armUp();        // Arm aus dem Fallbereich
   seedRandom();                  // jedes Mal neu, Tastendruck-Zeitpunkt = Zufall
 
   for (uint8_t i = 0; i < 2; i++) {
@@ -362,6 +378,8 @@ void shufflePass() {
   }
 
   passCount++;
+  lastPassOk = true;
+  cardsInMagazine = total;           // Magazin war vor dem Durchgang leer
   Serial.print(F("== Durchgang ")); Serial.print(passCount);
   Serial.println(F(" fertig =="));
   if (total != DECK_SIZE) {
@@ -374,33 +392,45 @@ void shufflePass() {
 }
 
 // =========================== AUSTEILEN ======================================
-const uint8_t HALFSTEP[8] = { 0b0001, 0b0011, 0b0010, 0b0110,
-                              0b0100, 0b1100, 0b1000, 0b1001 };
-
-void stepperWrite(uint8_t pattern) {
-  for (uint8_t i = 0; i < 4; i++) digitalWrite(PIN_STEP[i], (pattern >> i) & 1);
-}
-
-void stepperRelease() { stepperWrite(0); }   // Spulen stromlos (kein Erhitzen)
-
-// Fährt auf eine absolute Position (Halbschritte) mit Anfahr-/Bremsrampe
+// Fährt auf eine absolute Position (Mikroschritte) mit Anfahr-/Bremsrampe
 bool stepperMoveTo(int32_t target) {
   int32_t dist = target - stepPos;
   int8_t dir = dist >= 0 ? 1 : -1;
+  digitalWrite(PIN_DIR, (dir > 0) != STEP_REVERSE ? HIGH : LOW);
+  delayMicroseconds(5);
   int32_t n = labs(dist);
   for (int32_t i = 0; i < n; i++) {
-    if (checkAbort()) return false;
-    int32_t edge = min(i, n - 1 - i);               // Abstand zu Start/Ziel
+    if ((i & 0x3F) == 0 && checkAbort()) return false;
+    int32_t edge = min(i, n - 1 - i);
     uint16_t us = STEP_US_FAST;
     if (edge < RAMP_STEPS)
       us = STEP_US_SLOW - (uint32_t)(STEP_US_SLOW - STEP_US_FAST) * edge / RAMP_STEPS;
-    int8_t d = STEP_REVERSE ? -dir : dir;
-    stepPhase = (stepPhase + 8 + d) & 7;
-    stepperWrite(HALFSTEP[stepPhase]);
-    stepPos += dir;
+    digitalWrite(PIN_STEP, HIGH);
+    delayMicroseconds(3);
+    digitalWrite(PIN_STEP, LOW);
     delayMicroseconds(us);
+    stepPos += dir;
   }
   return true;
+}
+
+// --------------------------- Andruckarm -------------------------------------
+void armMove(uint8_t deg) {
+  if (!arm.attached()) arm.attach(PIN_SERVO);
+  arm.write(deg);
+}
+
+void armUp() {
+  armMove(ARM_UP_DEG);
+  delay(500);
+}
+
+// Arm auf den Stapel legen: Winkel aus der geschätzten Kartenzahl
+void armPress() {
+  uint8_t n = min(cardsInMagazine, DECK_SIZE);
+  int16_t deg = ARM_EMPTY_DEG - (int16_t)(ARM_EMPTY_DEG - ARM_FULL_DEG) * n / DECK_SIZE;
+  deg += (ARM_EMPTY_DEG > ARM_FULL_DEG) ? ARM_PRESS_DEG : -ARM_PRESS_DEG;
+  armMove(constrain(deg, 0, 180));
 }
 
 int32_t angleToSteps(uint16_t deg) {
@@ -415,8 +445,7 @@ uint16_t playerAngle(uint8_t i) {
 }
 
 bool dealerHasCard() {
-  bool low = analogRead(PIN_DEAL_SENS) < 512;
-  return DEAL_SENS_LOW_IS_CARD ? low : !low;
+  return digitalRead(PIN_DEAL_SENS) == LOW;
 }
 
 void dealMotorBrake() {
@@ -459,18 +488,23 @@ void dealRound() {
 
   digitalWrite(PIN_LED, HIGH);
   beep(1800, 60);
+  if (cardsInMagazine == 0) cardsInMagazine = DECK_SIZE;   // unbekannt -> voll annehmen
+  armPress();
+  delay(600);
   bool ok = true;
 
   for (uint8_t c = 0; c < cardsPerPlayer && ok; c++) {
     for (uint8_t p = 0; p < players && ok; p++) {
       if (!stepperMoveTo(angleToSteps(playerAngle(p)))) { ok = false; break; }
-      delay(40);                                  // ausschwingen lassen
+      delay(80);                                  // ausschwingen lassen
       if (!dealOneCard()) {
         Serial.println(F("!! Magazin vorzeitig leer."));
         ok = false;
         for (uint8_t i = 0; i < 3; i++) { beep(400, 250); delay(100); }
         break;
       }
+      if (cardsInMagazine) cardsInMagazine--;
+      armPress();                                  // Arm sinkt mit dem Stapel
     }
     // zurück zum Start (Kabel wickelt sich wieder ab)
     if (ok && !stepperMoveTo(0)) ok = false;
@@ -478,8 +512,8 @@ void dealRound() {
 
   abortRequested = false;
   stepperMoveTo(0);
-  stepperRelease();
   dealMotorOff();
+  armUp();
   digitalWrite(PIN_LED, LOW);
   if (ok) { Serial.println(F("== Ausgeteilt ==")); beep(2000, 80); beep(2600, 120); }
   else      Serial.println(F("== Austeilen abgebrochen =="));
@@ -525,7 +559,12 @@ void stepperTest() {
   stepperMoveTo(STEPS_PER_REV);
   delay(300);
   stepperMoveTo(0);
-  stepperRelease();
+}
+
+// Mischen und direkt austeilen
+void shuffleAndDeal() {
+  shufflePass();
+  if (lastPassOk) { delay(800); dealRound(); }
 }
 
 // ------------------------- TEST-FUNKTIONEN ----------------------------------
@@ -571,7 +610,7 @@ void singleCard(Side s) {
 
 void printHelp() {
   Serial.println(F("\nKartenmischer - Befehle:"));
-  Serial.println(F("  s  Mischen starten (x/s = Abbruch)"));
+  Serial.println(F("  s  Mischen starten (x = Abbruch)"));
   Serial.println(F("  l  eine Karte links ausgeben"));
   Serial.println(F("  r  eine Karte rechts ausgeben"));
   Serial.println(F("  t  Sensortest (5 s)"));
@@ -580,7 +619,9 @@ void printHelp() {
   Serial.println(F("  d  Austeilen starten"));
   Serial.println(F("  p4 Spielerzahl setzen (2-10), z.B. p6"));
   Serial.println(F("  k2 Karten pro Spieler (1-9), z.B. k5"));
-  Serial.println(F("  w  Drehtest Dealer   e  eine Karte werfen   z  Dealer-Sensor"));
+  Serial.println(F("  a  Mischen + Austeilen"));
+  Serial.println(F("  w  Drehtest   e  eine Karte werfen   z  Magazin-Sensor"));
+  Serial.println(F("  v90 Servo-Winkel testen   u  Arm hoch   c52 Karten im Magazin setzen"));
   Serial.println(F("  h  Hilfe"));
 }
 
@@ -595,10 +636,12 @@ void setup() {
   pinMode(PIN_SENSOR, INPUT_PULLUP);
   pinMode(PIN_DEAL_PWM, OUTPUT);
   pinMode(PIN_DEAL_IN2, OUTPUT);
-  for (uint8_t i = 0; i < 4; i++) pinMode(PIN_STEP[i], OUTPUT);
+  pinMode(PIN_STEP, OUTPUT);
+  pinMode(PIN_DIR, OUTPUT);
+  pinMode(PIN_DEAL_SENS, INPUT);
   dealMotorOff();
-  stepperRelease();
   loadSettings();
+  if (DEALER_ENABLED) armUp();
   pinMode(PIN_BUTTON, INPUT_PULLUP);
   pinMode(PIN_LED, OUTPUT);
   pinMode(PIN_BUZZER, OUTPUT);
@@ -623,11 +666,8 @@ void loop() {
     while (buttonPressed() && millis() - t0 < LONG_PRESS_MS) delay(5);
 
     if (millis() - t0 >= LONG_PRESS_MS) {
-      passCount = 0;
-      Serial.println(F("Durchgangszaehler zurueckgesetzt."));
-      beep(1000, 80); beep(800, 80);
-      blink(3, 60, 60);
       while (buttonPressed()) delay(5);
+      if (DEALER_ENABLED) shuffleAndDeal();
     } else if (millis() - t0 > 30) {   // Entprellung
       shufflePass();
     }
@@ -649,6 +689,18 @@ void loop() {
       case 'h': printHelp();        break;
       case 'd': dealRound();        break;
       case 'w': stepperTest();      break;
+      case 'a': shuffleAndDeal();   break;
+      case 'u': armUp(); Serial.println(F("Arm oben")); break;
+      case 'v': {                                  // Servo-Winkel testen: v90
+        int v = Serial.parseInt();
+        armMove(constrain(v, 0, 180));
+        Serial.print(F("Arm-Winkel: ")); Serial.println(v);
+      } break;
+      case 'c': {                                  // Karten im Magazin setzen: c52
+        int v = Serial.parseInt();
+        cardsInMagazine = constrain(v, 0, 255);
+        Serial.print(F("Karten im Magazin: ")); Serial.println(cardsInMagazine);
+      } break;
       case 'e': Serial.println(dealOneCard() ? F("Karte geworfen") : F("Magazin leer"));
                 dealMotorOff(); break;
       case 'z': Serial.println(dealerHasCard() ? F("Dealer: Karte im Magazin") : F("Dealer: leer"));
